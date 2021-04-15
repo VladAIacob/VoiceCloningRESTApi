@@ -1,27 +1,16 @@
 import flask
 from flask import request, jsonify, abort, send_from_directory
 from scipy.io import wavfile
+from synthesizer.inference import Synthesizer
 from encoder import inference as encoder
+from vocoder import inference as vocoder
 from pathlib import Path
 import numpy as np
 import subprocess
 import threading
 import librosa
-import torch
 import time
-import json
-import sys
 import os
-
-sys.path.insert(0, "flowtron")
-from flowtron import Flowtron
-from torch.utils.data import DataLoader
-from data import Data
-
-sys.path.insert(0, "flowtron/tacotron2")
-sys.path.insert(0, "flowtron/tacotron2/waveglow")
-from glow import WaveGlow
-
 
 app = flask.Flask(__name__)
 app.config["DEBUG"] = True
@@ -29,6 +18,12 @@ app.config["DEBUG"] = True
 #Data paths
 examplePath = "audio/examples"
 dataPath = "audio/data"
+synthesizer = ""
+
+#Example embeds
+barackobama = ""
+gordonRamsay = ""
+stephenHawking = ""
 
 #Create example embeds for an audio file
 def exampleEmbed(filename):
@@ -50,48 +45,13 @@ def examplesSetup():
 
 #Initializes the components with pretrained weights
 def setup():
-    # Parse configs.  Globals nicer in this case
-    with open("flowtron/infer.json") as f:
-        data = f.read()
-
-    global config
-    config = json.loads(data)
-
-    global data_config
-    data_config = config["data_config"]
-    global model_config
-    model_config = config["model_config"]
-
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = False
-
-    global flowtron
-    global waveglow
-    global trainset
-    
+    global synthesizer
     encoder_weights = Path("encoder/saved_models/pretrained.pt")
+    vocoder_weights = Path("vocoder/saved_models/pretrained/pretrained.pt")
+    syn_dir = Path("synthesizer/saved_models/logs-pretrained/taco_pretrained")
     encoder.load_model(encoder_weights)
-
-    torch.manual_seed(1234)
-    torch.cuda.manual_seed(1234)
-
-    #Load waveglow
-    waveglow = torch.load("flowtron/tacotron2/waveglow/saved_models/waveglow_256channels_universal_v5.pt")['model'].cuda().eval()
-    waveglow.cuda().half()
-    for k in waveglow.convinv:
-        k.float()
-    waveglow.eval()
-    
-    #Load flowtron
-    flowtron = Flowtron(**model_config).cuda()
-    state_dict = torch.load("flowtron/saved_models/pretrained.pt", map_location='cpu')['model'].state_dict()
-    flowtron.load_state_dict(state_dict)
-    flowtron.eval()
-
-    ignore_keys = ['training_files', 'validation_files']
-    trainset = Data(
-        data_config['training_files'],
-        **dict((k, v) for k, v in data_config.items() if k not in ignore_keys))
+    synthesizer = Synthesizer(syn_dir)
+    vocoder.load_model(vocoder_weights)
 
 #Generate audio from embeds
 def audioFromEmbeds(filename, embed):
@@ -101,24 +61,13 @@ def audioFromEmbeds(filename, embed):
     text = textFile.read().replace("\n", " ")
     textFile.close()
     
-    text = trainset.get_text(text).cuda()
-    embeds = trainset.get_embeds(embed).cuda()
-    text = text[None]
-    embeds = embeds[None]
+    #synthesize the text together with the embeds
+    specs = synthesizer.synthesize_spectrograms([text], [embed])
+  
+    #generate the audio using the vocoder
+    generated_wav = vocoder.infer_waveform(specs[0])
     
-    with torch.no_grad():
-        residual = torch.cuda.FloatTensor(1, 80, 400).normal_() * 0.5
-        mels, attentions = flowtron.infer(
-            residual, embeds, text, gate_threshold=0.5)
-
-    with torch.no_grad():
-        audio = waveglow.infer(mels.half(), sigma=0.8).float()
-
-    audio = audio.cpu().numpy()[0]
-    # normalize audio for now
-    audio = audio / np.abs(audio).max()
-    
-    return audio
+    return np.pad(generated_wav, (0, synthesizer.sample_rate), mode="constant")
 
 #Run the application on the 2 files sharing the name 'filename'
 def run_voiceCloning(filename):   
@@ -134,7 +83,7 @@ def run_voiceCloning(filename):
     #getting the embeds from the encoder
     embed = encoder.embed_utterance(preprocessed_wav)
     
-    return audioFromEmbeds(filename, [embed])
+    return audioFromEmbeds(filename, embed)
 
 #Delete all uploaded files when using examples
 def cleanExample(delay, path):
@@ -207,7 +156,7 @@ def examplePage(embed):
     
     filename = file.filename.split('.')[0]
     #generating the audio file
-    wavfile.write(dataPath + "/" + filename + "_out.wav", data_config['sampling_rate'], audioFromEmbeds(filename, [embed]))
+    wavfile.write(dataPath + "/" + filename + "_out.wav", synthesizer.sample_rate, audioFromEmbeds(filename, embed))
     
     #converting the audio file from .wav to .mp3
     in_fpath = dataPath + "/" + filename + "_out"
@@ -250,7 +199,7 @@ def post_file():
             file.save(open(os.path.join(dataPath, file.filename), "wb"))
     
     #generating the audio file         
-    wavfile.write(dataPath + "/" + sharedFileName + "_out.wav", data_config['sampling_rate'], run_voiceCloning(sharedFileName))
+    wavfile.write(dataPath + "/" + sharedFileName + "_out.wav", synthesizer.sample_rate, run_voiceCloning(sharedFileName))
     
     #converting the audio file from .wav to .mp3
     in_fpath = dataPath + "/" + sharedFileName + "_out"
